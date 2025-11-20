@@ -1,0 +1,223 @@
+class LastFM(BasicDataset):
+    """
+    LastFM数据集的实现类
+    继承自PyTorch的Dataset，包含图结构信息
+    """
+    def __init__(self, path="../data/lastfm"):
+        # 加载数据时的模式（训练或测试）
+        cprint("加载 [last fm] 数据集")
+        self.mode_dict = {'train': 0, "test": 1}
+        self.mode = self.mode_dict['train']  # 默认训练模式
+        
+        # 读取训练集、测试集和社交网络数据
+        trainData = pd.read_table(join(path, 'data1.txt'), header=None)
+        testData = pd.read_table(join(path, 'test1.txt'), header=None)
+        # 用户之间的信任关系，作用是 在协同过滤中融入信任网络
+        # 利用用户的信任关系提升推荐准确性（比如信任的人喜欢的物品更可能被推荐
+        trustNet = pd.read_table(join(path, 'trustnetwork.txt'), header=None).to_numpy()
+        
+        # 数据索引从0开始（原始数据可能从1开始，需减1）
+        trustNet -= 1
+        trainData -= 1
+        testData -= 1
+        
+        # 存储原始数据
+        self.trustNet = trustNet  # 社交网络（用户-用户信任关系）
+        self.trainData = trainData
+        self.testData = testData
+        
+        # 提取训练集的用户和物品ID
+        self.trainUser = np.array(trainData[:][0])
+        self.trainUniqueUsers = np.unique(self.trainUser)  # 去重的训练用户
+        self.trainItem = np.array(trainData[:][1])
+        
+        # 提取测试集的用户和物品ID
+        self.testUser = np.array(testData[:][0])
+        self.testUniqueUsers = np.unique(self.testUser)  # 去重的测试用户
+        self.testItem = np.array(testData[:][1])
+        
+        self.Graph = None  # 存储稀疏图（延迟初始化）
+        
+        # 打印数据集稀疏度（交互数 / 总可能数）
+        print(f"LastFm 稀疏度 : {(len(self.trainUser) + len(self.testUser)) / self.n_users / self.m_items}")
+        
+        # 构建稀疏矩阵
+        # 社交网络矩阵（用户-用户，信任关系）
+        self.socialNet = csr_matrix(
+            (np.ones(len(trustNet)), (trustNet[:, 0], trustNet[:, 1])),
+            shape=(self.n_users, self.n_users)
+        )
+        # 用户-物品交互矩阵（二部图）
+        self.UserItemNet = csr_matrix(
+            (np.ones(len(self.trainUser)), (self.trainUser, self.trainItem)),
+            shape=(self.n_users, self.m_items)
+        )
+        
+        # 预计算每个用户的正样本和负样本
+        self._allPos = self.getUserPosItems(list(range(self.n_users)))  # 所有用户的正样本
+        self.allNeg = []  # 所有用户的负样本
+        allItems = set(range(self.m_items))  # 所有物品的集合
+        for i in range(self.n_users):
+            pos = set(self._allPos[i])  # 当前用户的正样本
+            neg = allItems - pos  # 负样本 = 所有物品 - 正样本
+            self.allNeg.append(np.array(list(neg)))
+        
+        # 构建测试集字典
+        self.__testDict = self.__build_test()
+
+    @property
+    def n_users(self):
+        """LastFM数据集的用户数量（固定值）"""
+        return 1892
+    
+    @property
+    def m_items(self):
+        """LastFM数据集的物品数量（固定值）"""
+        return 4489
+    
+    @property
+    def trainDataSize(self):
+        """训练集交互数量"""
+        return len(self.trainUser)
+    
+    @property
+    def testDict(self):
+        """测试集字典 {用户: [物品列表]}"""
+        return self.__testDict
+
+    @property
+    def allPos(self):
+        """所有用户的正样本列表"""
+        return self._allPos
+
+    def getSparseGraph(self):
+        """构建并返回用户-物品二部图的稀疏矩阵（带归一化）"""
+        if self.Graph is None:  # 延迟初始化，首次调用时构建
+            # 转换用户和物品ID为LongTensor
+            user_dim = torch.LongTensor(self.trainUser)
+            item_dim = torch.LongTensor(self.trainItem)
+            
+            # 构建邻接矩阵的索引（用户-物品 和 物品-用户 边）
+            # 物品ID偏移：物品索引 = 物品ID + 用户数量（避免与用户ID冲突）
+            first_sub = torch.stack([user_dim, item_dim + self.n_users])  # 用户->物品边
+            second_sub = torch.stack([item_dim + self.n_users, user_dim])  # 物品->用户边
+            index = torch.cat([first_sub, second_sub], dim=1)  # 合并所有边
+            data = torch.ones(index.size(-1)).int()  # 边的权重初始化为1
+            
+            # 构建初始稀疏邻接矩阵（未归一化）
+            self.Graph = torch.sparse.IntTensor(
+                index, data, 
+                torch.Size([self.n_users + self.m_items, self.n_users + self.m_items])
+            )
+            
+            # 归一化邻接矩阵（对称归一化：D^-0.5 * A * D^-0.5）
+            dense = self.Graph.to_dense()  # 转为稠密矩阵计算度
+            D = torch.sum(dense, dim=1).float()  # 计算每个节点的度（行和）
+            D[D == 0.] = 1.  # 避免除零错误
+            D_sqrt = torch.sqrt(D).unsqueeze(dim=0)  # 度的平方根（行向量）
+            dense = dense / D_sqrt  # 左乘D^-0.5
+            dense = dense / D_sqrt.t()  # 右乘D^-0.5（转置为列向量）
+            
+            # 重新构建稀疏矩阵（只保留非零元素）
+            index = dense.nonzero()  # 非零元素的索引
+            data = dense[dense >= 1e-9]  # 非零元素的值（过滤微小值）
+            assert len(index) == len(data)  # 索引和值的数量必须一致
+            
+            # 构建归一化后的稀疏矩阵并移动到指定设备
+            self.Graph = torch.sparse.FloatTensor(
+                index.t(), data, 
+                torch.Size([self.n_users + self.m_items, self.n_users + self.m_items])
+            )
+            self.Graph = self.Graph.coalesce().to(world.device)  # 合并重复索引并移至设备
+        return self.Graph
+
+    def __build_test(self):
+        """
+        构建测试集字典
+        Returns:
+            dict: {用户ID: [该用户在测试集的物品列表]}
+        """
+        test_data = {}
+        for i, item in enumerate(self.testItem):
+            user = self.testUser[i]
+            if test_data.get(user):
+                test_data[user].append(item)
+            else:
+                test_data[user] = [item]
+        return test_data
+    
+    def getUserItemFeedback(self, users, items):
+        """
+        获取用户对物品的交互反馈（1表示有交互，0表示无）
+        Args:
+            users: 用户ID列表
+            items: 物品ID列表
+        Returns:
+            反馈列表（numpy数组）
+        """
+        return np.array(self.UserItemNet[users, items]).astype('uint8').reshape((-1, ))
+    
+    def getUserPosItems(self, users):
+        """
+        获取指定用户的正样本物品列表
+        Args:
+            users: 用户ID列表
+        Returns:
+            列表的列表，每个子列表为对应用户的正样本物品
+        """
+        posItems = []
+        for user in users:
+            # 从稀疏矩阵中提取该用户有交互的物品ID
+            posItems.append(self.UserItemNet[user].nonzero()[1])
+        return posItems
+    
+    def getUserNegItems(self, users):
+        """
+        获取指定用户的负样本物品列表
+        Args:
+            users: 用户ID列表
+        Returns:
+            列表的列表，每个子列表为对应用户的负样本物品
+        """
+        negItems = []
+        for user in users:
+            negItems.append(self.allNeg[user])
+        return negItems
+            
+    def __getitem__(self, index):
+        """
+        实现Dataset的核心方法，支持按索引获取样本
+        Args:
+            index: 索引
+        Returns:
+            训练集中的用户ID（用于迭代训练用户）
+        """
+        user = self.trainUniqueUsers[index]
+        return user  # 返回用户ID（后续可根据用户ID获取正负样本）
+    
+    def switch2test(self):
+        """切换数据集模式为测试模式（供DataLoader使用）"""
+        self.mode = self.mode_dict['test']
+    
+    def __len__(self):
+        """返回训练集中的用户数量（用于迭代长度）"""
+        return len(self.trainUniqueUsers)
+
+交互 矩阵 A‘
+      用户  物品
+ 用户       val
+
+ 物品  val
+
+嵌入矩阵 E
+        用户 物品
+ 隐维度
+用户 M 物品 N
+
+A’ [M+N,M+N]
+E  [M+N,T]
+
+A'E [M+N,T]
+第227物品
+
+pos = 227 + 物品数量
